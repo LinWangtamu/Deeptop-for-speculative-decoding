@@ -1,52 +1,3 @@
-"""
-Speculative Decoding serving environment for DeepTOP.
-
-State (a python list; state[0] is the SCALAR compared against the
-learned threshold, state[1:] is the VECTOR fed to the actor):
-    state = [ batch_size / MAX_NUM_SEQS,   # scalar
-              alpha_estimate,              # vector[0]
-              backlog / 50 ]               # vector[1]
-
-Action: 1 -> speculate this step (k=5);  0 -> normal decode (k=0)
-
-The learned DeepTOP policy is:
-    speculate  iff  threshold(alpha_est, backlog) > normalized_batch_size
-
-Reward (per step, includes queueing):
-    reward = -(step_latency * num_requests_in_system) / reward_norm
-    clipped to [-1, 0] for stability.
-
-Episode: fixed wall-clock duration with Poisson arrivals; the arrival
-rate lambda is re-randomized every episode (generalization across loads).
-Episode terminates when the clock passes `duration` and all requests drain.
-"""
-
-import gym
-import numpy as np
-from gym import spaces
-
-
-# =============================================================================
-# Latency model (SmartSpec Eq.7), A100 + LLaMA-7B target + LLaMA-160M draft
-# =============================================================================
-_ALPHA_T, _GAMMA_T, _DELTA_T = 1.5e-6, 2.5e-4, 0.011
-_ALPHA_D, _GAMMA_D, _DELTA_D = 0.3e-6, 1.5e-6, 0.002
-_K_SPEC = 5              # speculation length when SD is on
-_MAX_NUM_SEQS = 32       # max requests per decode step (vLLM-style cap)
-
-
-def spec_t_fwd(nc, nb, a=_ALPHA_T, g=_GAMMA_T, d=_DELTA_T):
-    """Single forward pass latency: T = delta + alpha*N_context + gamma*N_batched."""
-    return d + a * nc + g * nb
-
-
-def spec_t_decode_step(batch, k):
-    """Decode step latency. k=0: target only. k>0: k draft passes + 1 verify pass."""
-    nc = sum(r.context_len for r in batch)
-    bs = len(batch)
-    if k == 0:
-        return spec_t_fwd(nc, bs)
-    return k * spec_t_fwd(nc, bs, _ALPHA_D, _GAMMA_D, _DELTA_D) + spec_t_fwd(nc, bs * (k + 1))
 
 
 def spec_t_prefill(pl):
@@ -147,19 +98,25 @@ class SpecDecodingEnv(gym.Env):
         self.reward_norm = reward_norm
 
         self.action_space = spaces.Discrete(2)
+        self.observation_space = spaces.Box(
+            low=np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            high=np.array([1.0, 1.0, np.inf, 1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+        self._holding_cost = 0.0
 
     # ---------- internal helpers ----------
     def _state(self):
         bs = len(self.active)
         backlog = max(0, len(self.active) - _MAX_NUM_SEQS) + len(self.prefill_q) + len(self.waiting)
         if self.active:
-        avg_ctx = sum(r.context_len for r in self.active) / len(self.active)
+            avg_ctx = sum(r.context_len for r in self.active) / len(self.active)
         else:
             avg_ctx = 0.0
         return [
             float(min(bs, _MAX_NUM_SEQS)) / _MAX_NUM_SEQS,   # scalar
             float(self.at.value),                            # vector[0]: alpha estimate
-            float(avg_ctx) / 256.0,                          # vector[1]: avg context len  ← 新增
+            float(avg_ctx) / 256.0,                          # vector[1]: average context length
             float(min(backlog, 50)) / 50.0,                  # vector[2]: backlog
         ]
 
@@ -177,8 +134,15 @@ class SpecDecodingEnv(gym.Env):
         i = 0
         while i < len(self.prefill_q):
             r = self.prefill_q[i]
-            if self.kv.can_allocate(r.prompt_len + r.decode_len):
-                self.kv.allocate(r.prompt_len + r.decode_len)
+            request_tokens = r.prompt_len + r.decode_len
+            if request_tokens > self.kv.max_tokens:
+                raise ValueError(
+                    "Request {} needs {} KV tokens, exceeding max_tokens={}".format(
+                        r.req_id, request_tokens, self.kv.max_tokens
+                    )
+                )
+            if self.kv.can_allocate(request_tokens):
+                self.kv.allocate(request_tokens)
                 self.waiting.append(self.prefill_q.pop(i))
             else:
                 i += 1
@@ -186,7 +150,9 @@ class SpecDecodingEnv(gym.Env):
     def _prefill(self):
         for r in list(self.waiting):
             if not r.prefill_done:
-                self.clock += spec_t_prefill(r.prompt_len)
+                prefill_t = spec_t_prefill(r.prompt_len)
+                self._holding_cost += prefill_t * self._num_in_system()
+                self.clock += prefill_t
                 r.context_len = r.prompt_len
                 r.prefill_done = True
                 self.waiting.remove(r)
@@ -213,6 +179,7 @@ class SpecDecodingEnv(gym.Env):
         n_in_system = self._num_in_system()
 
         step_t = spec_t_decode_step(batch, k)
+        self._holding_cost += step_t * n_in_system
         self.clock += step_t
 
         for r in list(batch):
@@ -229,22 +196,18 @@ class SpecDecodingEnv(gym.Env):
                     self.done_latencies.append(r.latency)
                 self.active.remove(r)
 
-        # Clip reward to [-1, 0]: with reward_norm=50 the natural reward is
-        # already in this range across all lambdas; the clip is a safety net.
-        reward = -(step_t * n_in_system) / self.reward_norm
-        reward = max(reward, -1.0)
-        nextState = self._state()
-        return nextState, reward
-
     def step(self, action):
         """One decode step of the serving system."""
-        assert action in [0, 1]
+        if not self.action_space.contains(action):
+            raise ValueError("action must be 0 or 1, got {!r}".format(action))
 
-        nextState, reward = self._calRewardAndState(action)
+        self._holding_cost = 0.0
+        self._calRewardAndState(action)
 
         has_work = self._advance_to_decodable()
         done = not has_work          # episode ends when fully drained
         nextState = self._state()
+        reward = max(-self._holding_cost / self.reward_norm, -1.0)
 
         info = {
             'lam': self.lam,
@@ -265,6 +228,7 @@ class SpecDecodingEnv(gym.Env):
         self.active = []
         self.done_latencies = []
         self.rid = 0
+        self._holding_cost = 0.0
 
         self.arrivals = []
         t = 0.0
