@@ -152,10 +152,15 @@ class SpecDecodingEnv(gym.Env):
     def _state(self):
         bs = len(self.active)
         backlog = max(0, len(self.active) - _MAX_NUM_SEQS) + len(self.prefill_q) + len(self.waiting)
+        if self.active:
+        avg_ctx = sum(r.context_len for r in self.active) / len(self.active)
+        else:
+            avg_ctx = 0.0
         return [
             float(min(bs, _MAX_NUM_SEQS)) / _MAX_NUM_SEQS,   # scalar
-            float(self.at.value),                            # vector[0]
-            float(min(backlog, 50)) / 50.0,                  # vector[1]
+            float(self.at.value),                            # vector[0]: alpha estimate
+            float(avg_ctx) / 256.0,                          # vector[1]: avg context len  ← 新增
+            float(min(backlog, 50)) / 50.0,                  # vector[2]: backlog
         ]
 
     def _num_in_system(self):
