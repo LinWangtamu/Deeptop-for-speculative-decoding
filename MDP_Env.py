@@ -130,7 +130,7 @@ class SpecDecodingEnv(gym.Env):
     metadata = {'render.modes': ['human']}
 
     def __init__(self, seed, duration=120.0, warmup=20.0,
-                 lam_low=2.0, lam_high=18.0, true_alpha=0.7,
+                 lam_low=0.5, lam_high=20.0, true_alpha=0.7,
                  avg_prompt=128.0, avg_decode=128.0,
                  max_tokens=200000, reward_norm=50.0):
         super(SpecDecodingEnv, self).__init__()
