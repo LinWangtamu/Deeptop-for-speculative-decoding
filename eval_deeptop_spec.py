@@ -82,7 +82,7 @@ def avg(policy, lam, seeds=5, actor=None):
 
 
 if __name__ == "__main__":
-    actor = Actor(2, 1, [128, 128])
+    actor = Actor(3, 1, [128, 128])
     actor.load_state_dict(torch.load("deeptop_spec_actor.pkl",
                                      map_location="cpu"))
     actor.eval()
