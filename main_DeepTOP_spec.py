@@ -104,7 +104,10 @@ if __name__ == '__main__':
         # env responds with next_state, reward, terminate_info
         next_state, reward, done, info = env.step(action[0])
         next_state = deepcopy(next_state)
-
+ # === DEBUG: peek at state values ===
+        if num_step % 500 == 0:
+            print(f"  [debug] step {num_step}: state={[round(v,3) for v in next_state]}, "
+                  f"action={action[0]}, reward={reward:.4f}")
         # agent observes and updates policy
         agent.observe(reward, next_state, done)
         if num_step > args.warmup:
