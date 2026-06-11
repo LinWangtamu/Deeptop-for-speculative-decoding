@@ -68,7 +68,7 @@ if __name__ == '__main__':
     state = None
     # state = [batch_size/MAX(scalar), alpha_est, backlog_norm]
     # state_dim counts ONLY the vector part (excludes the scalar).
-    state_dim = 2
+    state_dim = 3
     action_dim = 1
     initializeEnv()
 
@@ -135,11 +135,12 @@ if __name__ == '__main__':
     print('\nLearned threshold over (alpha, backlog) grid:')
     print('(speculate iff threshold > batch_size/32)')
     for alpha in [0.3, 0.5, 0.7, 0.9]:
+    for avg_ctx in [0.3, 0.7]:           # 0.3= short context, 0.7= long context
         for backlog in [0.0, 0.5]:
-            thr = agent.actor.forward(
-                torch.FloatTensor([alpha, backlog]).to(agent.device)).cpu().item()
-            print(f'  alpha={alpha:.1f} backlog={backlog:.1f}: '
-                  f'threshold={thr:.3f} -> batch cutoff={thr*32:.1f}')
+            thr = torch.sigmoid(agent.actor.forward(
+                torch.FloatTensor([alpha, avg_ctx, backlog]).to(agent.device))).cpu().item()
+            print(f'  alpha={alpha} avg_ctx={avg_ctx} backlog={backlog}: '
+                  f'thr={thr:.3f} -> cutoff={thr*32:.1f}')
 
     torch.save(agent.actor.state_dict(), 'deeptop_spec_actor.pkl')
     print('\nSaved actor to deeptop_spec_actor.pkl')
