@@ -151,7 +151,7 @@ class SpecDecodingEnv(gym.Env):
     # ---------- internal helpers ----------
     def _state(self):
         bs = len(self.active)
-        backlog = len(self.prefill_q) + len(self.waiting)
+        backlog = max(0, len(self.active) - _MAX_NUM_SEQS) + len(self.prefill_q) + len(self.waiting)
         return [
             float(min(bs, _MAX_NUM_SEQS)) / _MAX_NUM_SEQS,   # scalar
             float(self.at.value),                            # vector[0]
