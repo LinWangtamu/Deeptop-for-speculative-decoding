@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+deeptop_spec_actor.pkl
+deeptop_eval.png

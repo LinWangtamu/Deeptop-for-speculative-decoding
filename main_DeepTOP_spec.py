@@ -98,3 +98,50 @@ if __name__ == '__main__':
             action = agent.random_action()
         elif random.uniform(0, 1.0) < 0.05:
             action = agent.random_action()
+        else:
+            action = agent.select_action(state)
+
+        # env responds with next_state, reward, terminate_info
+        next_state, reward, done, info = env.step(action[0])
+        next_state = deepcopy(next_state)
+ # === DEBUG: peek at state values ===
+        if num_step % 500 == 0:
+            print(f"  [debug] step {num_step}: state={[round(v,3) for v in next_state]}, "
+                  f"action={action[0]}, reward={reward:.4f}")
+        # agent observes and updates policy
+        agent.observe(reward, next_state, done)
+        if num_step > args.warmup:
+            cumulative_reward = cumulative_reward + reward
+            agent.update_policy()
+            if ((num_step - args.warmup) % 1000 == 0):
+                recent = (np.mean(recent_latencies[-20:])
+                          if recent_latencies else float('nan'))
+                print(f'step {num_step}: avg_reward {cumulative_reward/1000:.4f}, '
+                      f'recent mean latency {recent:.3f}, episodes {episode_count}')
+                cumulative_reward = 0
+
+        state = deepcopy(next_state)
+
+        # episode ended (clock past duration and system drained) -> new episode
+        if done:
+            episode_count += 1
+            if info['mean_latency'] is not None:
+                recent_latencies.append(info['mean_latency'])
+            resetEnvs()
+            agent.reset(state)
+            state = deepcopy(state)
+
+    # ---- after training: inspect learned threshold, save actor ----
+    print('\nLearned threshold over (alpha, backlog) grid:')
+    print('(speculate iff threshold > batch_size/32)')
+    for alpha in [0.3, 0.5, 0.7, 0.9]:
+        for avg_ctx in [0.3, 0.7]:       # 0.3 = short context, 0.7 = long context
+            for backlog in [0.0, 0.5]:
+                thr = agent.actor.forward(
+                    torch.FloatTensor([alpha, avg_ctx, backlog]).to(agent.device)
+                ).cpu().item()
+                print(f'  alpha={alpha} avg_ctx={avg_ctx} backlog={backlog}: '
+                      f'thr={thr:.3f} -> cutoff={thr*32:.1f}')
+
+    torch.save(agent.actor.state_dict(), 'deeptop_spec_actor.pkl')
+    print('\nSaved actor to deeptop_spec_actor.pkl')

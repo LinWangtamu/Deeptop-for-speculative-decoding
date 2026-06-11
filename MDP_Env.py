@@ -1,3 +1,59 @@
+"""
+Speculative Decoding serving environment for DeepTOP.
+
+State (a python list; state[0] is the SCALAR compared against the
+learned threshold, state[1:] is the VECTOR fed to the actor):
+    state = [ batch_size / MAX_NUM_SEQS,   # scalar
+              alpha_estimate,              # vector[0]
+              average_context / 256,        # vector[1]
+              backlog / 50 ]                # vector[2]
+
+Action: 1 -> speculate this step (k=5);  0 -> normal decode (k=0)
+
+The learned DeepTOP policy is:
+    speculate iff threshold(alpha_est, average_context, backlog)
+                  > normalized_batch_size
+
+Reward (per step, includes queueing):
+    reward = -(holding_cost accumulated during the step) / reward_norm
+    clipped to [-1, 0] for stability.
+
+Episode: fixed wall-clock duration with Poisson arrivals; the arrival
+rate lambda is re-randomized every episode (generalization across loads).
+Episode terminates when the clock passes `duration` and all requests drain.
+"""
+
+import numpy as np
+
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+except ImportError:
+    import gym
+    from gym import spaces
+
+
+# =============================================================================
+# Latency model (SmartSpec Eq.7), A100 + LLaMA-7B target + LLaMA-160M draft
+# =============================================================================
+_ALPHA_T, _GAMMA_T, _DELTA_T = 1.5e-6, 2.5e-4, 0.011
+_ALPHA_D, _GAMMA_D, _DELTA_D = 0.3e-6, 1.5e-6, 0.002
+_K_SPEC = 5              # speculation length when SD is on
+_MAX_NUM_SEQS = 32       # max requests per decode step (vLLM-style cap)
+
+
+def spec_t_fwd(nc, nb, a=_ALPHA_T, g=_GAMMA_T, d=_DELTA_T):
+    """Single forward pass latency: T = delta + alpha*N_context + gamma*N_batched."""
+    return d + a * nc + g * nb
+
+
+def spec_t_decode_step(batch, k):
+    """Decode step latency. k=0: target only. k>0: k draft passes + 1 verify pass."""
+    nc = sum(r.context_len for r in batch)
+    bs = len(batch)
+    if k == 0:
+        return spec_t_fwd(nc, bs)
+    return k * spec_t_fwd(nc, bs, _ALPHA_D, _GAMMA_D, _DELTA_D) + spec_t_fwd(nc, bs * (k + 1))
 
 
 def spec_t_prefill(pl):
