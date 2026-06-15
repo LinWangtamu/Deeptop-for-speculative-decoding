@@ -41,11 +41,25 @@ The learned DeepTOP policy is:
     speculate iff threshold(alpha_est, average_context, backlog)
                   > normalized_decode_batch
 
-Reward (per step, includes queueing):
-    reward = -(holding_cost accumulated during the step) / reward_norm
-    clipped to [-1, 0] for stability.
-    The holding cost of a step covers the WHOLE unified forward pass (prefill
-    chunks + decode), since prefill is no longer a separate clock advance.
+Reward (per step):
+    reward = tokens_this_step / token_norm  -  holding_cost / reward_norm
+
+    The holding cost (sum over the step of step_latency * #-in-system) is the
+    classic queueing proxy for latency: by Little's law its long-run average is
+    proportional to mean E2E latency. The holding cost of a step covers the
+    WHOLE unified forward pass (prefill chunks + decode), since prefill is no
+    longer a separate clock advance.
+
+    This task is trained with the AVERAGE-REWARD objective (no discounting): the
+    speculate-or-not decision pays off (faster drain -> lower future holding)
+    over thousands of steps, a horizon that any gamma < 1 discounts away, so a
+    discounted return inverts the sign of the optimum. Under average reward,
+    maximizing mean per-step reward == minimizing mean #-in-system == minimizing
+    mean latency. For that objective the token term is left OFF (token_norm
+    large, i.e. pure holding cost) and NO reward clipping is applied, so the
+    overload region keeps the gradient the load-dependent speculation threshold
+    relies on. The token term and reward_clip remain available for discounted-RL
+    experiments but are not used by the average-reward setup.
 
 Episode: fixed wall-clock duration with Poisson arrivals; the arrival rate
 lambda is re-randomized every episode (generalization across loads). Episode
@@ -65,36 +79,61 @@ except ImportError:
 
 
 # =============================================================================
-# Latency model (SmartSpec Eq.7), A100 + LLaMA-7B target + LLaMA-160M draft
+# Latency model: H100, fitted. Two forward kinds.
+#   target_fwd(n_kv, n_query) = c_fixed + c_kv * N_kv + c_compute * N_query
+#       big model; N_kv = total context (KV) attended, N_query = query tokens.
+#   draft_step(n_kv, n_spec)  = c_fixed + c_kv * N_kv + c_spec * N_spec
+#       small model run ONCE to produce n_spec draft tokens (KV is reused across
+#       the k autoregressive draft steps, so cost is linear in #spec tokens, NOT
+#       k independent full-context passes).
+#
+#   no speculation (k=0): t = target_fwd(N_kv, bs)            # 1 query / seq
+#   speculation   (k>0) : t = draft_step(N_kv, k*bs)          # draft k tokens/seq
+#                           + target_fwd(N_kv, bs*(k+1))      # verify k+1 pos/seq
 # =============================================================================
-_ALPHA_T, _GAMMA_T, _DELTA_T = 1.5e-6, 2.5e-4, 0.011
-_ALPHA_D, _GAMMA_D, _DELTA_D = 0.3e-6, 1.5e-6, 0.002
+_TARGET_C_KV      = 3.92645679e-08   # target: per KV token attended
+_TARGET_C_COMPUTE = 2.10103129e-05   # target: per query token
+_TARGET_C_FIXED   = 5.88590713e-03   # target: fixed per-forward overhead
+_DRAFT_C_KV       = 2.37768493e-09   # draft: per KV token attended
+_DRAFT_C_SPEC     = 8.41429603e-07   # draft: per spec token generated
+_DRAFT_C_FIXED    = 2.13526175e-03   # draft: fixed per-call overhead
+
 _K_SPEC = 5                     # speculation length when SD is on
 _MAX_NUM_SEQS = 32              # max RUNNING requests (vLLM max_num_seqs cap)
 _MAX_NUM_BATCHED_TOKENS = 2048  # per-step token budget (vLLM max_num_batched_tokens)
 
 
-def spec_t_fwd(nc, nb, a=_ALPHA_T, g=_GAMMA_T, d=_DELTA_T):
-    """Single forward pass latency: T = delta + alpha*N_context + gamma*N_batched."""
-    return d + a * nc + g * nb
+def target_fwd(n_kv, n_query):
+    """Big-model forward: fixed + KV-attention cost + per-query-token cost."""
+    return _TARGET_C_FIXED + _TARGET_C_KV * n_kv + _TARGET_C_COMPUTE * n_query
+
+
+def draft_step(n_kv, n_spec):
+    """Draft model generating n_spec tokens (KV reused; cost linear in n_spec)."""
+    return _DRAFT_C_FIXED + _DRAFT_C_KV * n_kv + _DRAFT_C_SPEC * n_spec
+
+
+# Backward-compat alias: spec_t_fwd historically meant a target forward pass.
+def spec_t_fwd(nc, nb):
+    return target_fwd(nc, nb)
 
 
 def spec_t_decode_step(batch, k):
-    """Decode step latency. k=0: target only. k>0: k draft passes + 1 verify pass.
+    """Decode step latency. k=0: target only. k>0: one draft call + one verify.
 
-    Kept for reference / unit tests. The env now uses `_unified_step_latency`,
-    which is a strict generalization (it reduces to this when the batch has no
-    prefill chunks).
+    Kept for reference / the SmartSpec baseline. The env uses
+    `_unified_step_latency`, which is a strict generalization (it reduces to this
+    when the batch has no prefill chunks).
     """
-    nc = sum(r.context_len for r in batch)
+    n_kv = sum(r.context_len for r in batch)
     bs = len(batch)
     if k == 0:
-        return spec_t_fwd(nc, bs)
-    return k * spec_t_fwd(nc, bs, _ALPHA_D, _GAMMA_D, _DELTA_D) + spec_t_fwd(nc, bs * (k + 1))
+        return target_fwd(n_kv, bs)
+    return draft_step(n_kv, k * bs) + target_fwd(n_kv, bs * (k + 1))
 
 
 def spec_t_prefill(pl):
-    return spec_t_fwd(0, pl)
+    return target_fwd(0, pl)
 
 
 # =============================================================================
@@ -190,7 +229,8 @@ class SpecDecodingEnv(gym.Env):
     def __init__(self, seed, duration=120.0, warmup=20.0,
                  lam_low=0.5, lam_high=20.0, true_alpha=0.7,
                  avg_prompt=128.0, avg_decode=128.0,
-                 max_tokens=200000, reward_norm=50.0, token_norm=50.0,
+                 max_tokens=200000, reward_norm=50.0, token_norm=1e9,
+                 reward_clip=None,
                  max_num_seqs=_MAX_NUM_SEQS,
                  max_num_batched_tokens=_MAX_NUM_BATCHED_TOKENS,
                  long_prefill_token_threshold=0,
@@ -208,6 +248,7 @@ class SpecDecodingEnv(gym.Env):
         self.max_tokens = max_tokens
         self.reward_norm = reward_norm
         self.token_norm = token_norm
+        self.reward_clip = reward_clip
 
         # vLLM-style scheduling knobs.
         self.max_num_seqs = max_num_seqs
@@ -344,14 +385,15 @@ class SpecDecodingEnv(gym.Env):
         if k == 0 or n_dec == 0:
             # One target forward pass over the whole unified batch:
             # decoders contribute 1 query each, prefills contribute their chunk.
-            return spec_t_fwd(c_dec + c_pre, n_dec + q_pre)
+            return target_fwd(c_dec + c_pre, n_dec + q_pre)
 
         # Speculative decode with decoders present:
-        #   * k draft forward passes over the decode set (draft model)
-        #   * 1 target verify pass over the FULL batch; decoders verify (k+1)
+        #   * ONE draft call generating k spec tokens for each decoder
+        #     (n_spec = k * n_dec; attends the decode context only).
+        #   * ONE target verify pass over the FULL batch; decoders verify (k+1)
         #     positions each, prefill chunks contribute their query tokens.
-        t_draft = k * spec_t_fwd(c_dec, n_dec, _ALPHA_D, _GAMMA_D, _DELTA_D)
-        t_verify = spec_t_fwd(c_dec + c_pre, n_dec * (k + 1) + q_pre)
+        t_draft = draft_step(c_dec, k * n_dec)
+        t_verify = target_fwd(c_dec + c_pre, n_dec * (k + 1) + q_pre)
         return t_draft + t_verify
 
     def _retire(self, r):
@@ -437,6 +479,7 @@ class SpecDecodingEnv(gym.Env):
 
         self._holding_cost = 0.0
         self._tokens_this_step = 0
+        t_before = self.clock
 
         scheduled = self._schedule()
         self._execute(scheduled, action)
@@ -444,17 +487,26 @@ class SpecDecodingEnv(gym.Env):
         has_work = self._advance_to_work()
         done = not has_work          # episode ends when fully drained
         nextState = self._state()
-        # Token-aware reward: credit output tokens produced THIS step (so the
-        # benefit of speculation is immediate) and charge the holding cost.
-        # With the token term in place, a normal gamma (e.g. 0.99) suffices --
-        # no need for the near-1 gamma that a pure holding-cost reward forces.
+        # Holding-cost reward (Little's-law latency proxy). The token term is
+        # off by default (token_norm large) so this is pure -holding/reward_norm;
+        # trained with the average-reward objective, NOT discounting. No clip by
+        # default -- clipping would flatten the overload gradient the threshold
+        # depends on. reward_clip can be set for discounted-RL experiments.
         reward = (self._tokens_this_step / self.token_norm
                   - self._holding_cost / self.reward_norm)
-        reward = max(reward, -1.0)
+        if self.reward_clip is not None:
+            reward = max(reward, self.reward_clip)
+
+        # SMDP step duration (wall-clock advanced by this step, including any
+        # idle-skip to the next arrival). Speculation changes how much time/work
+        # one step represents, so average-reward training must weight by tau
+        # rather than by step count.
+        tau = self.clock - t_before
 
         info = {
             'lam': self.lam,
             'clock': self.clock,
+            'tau': tau,
             'mean_latency': (float(np.mean(self.done_latencies))
                              if self.done_latencies else None),
         }
