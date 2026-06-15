@@ -43,22 +43,22 @@ class DeepTOP_MDP(object):
         # Hyper-parameters
         self.batch_size = args.bsize
         self.tau = args.tau
-        self.discount = args.discount   # NOTE: unused in average-reward mode (kept for compat)
+        self.discount = args.discount   # NOTE: unused in average-reward SMDP mode (kept for compat)
         self.depsilon = 1.0 / args.epsilon
 
-        # --- Average-reward (differential) setup -------------------------------
-        # This task is a long, continuing queueing process whose objective is the
-        # UNDISCOUNTED average reward (== minimize average #-in-system == average
-        # latency, by Little's law). Discounting (gamma=0.99) has a ~100-step
-        # horizon, far shorter than the thousands of steps over which a
-        # speculation decision pays off, so it inverts the sign of the return.
-        # We therefore learn a DIFFERENTIAL value function with TD target
-        #     target = (reward - rho) + (1-done) * Q(s', a')
-        # where rho is a running estimate of the policy's average reward. rho only
-        # recenters Q (the actor uses Q-differences, which are invariant to it),
-        # but it keeps the differential Q bounded.
+        # --- Average-reward SMDP setup ----------------------------------------
+        # This is a SEMI-MDP: the speculate/no-speculate action changes how much
+        # wall-clock time (tau = step_t) one step represents, so per-step
+        # discounting OR per-step averaging both distort the true objective
+        # (minimize mean latency == minimize time-averaged #-in-system). We
+        # therefore optimize the average REWARD RATE and use the SMDP
+        # differential TD target
+        #     target = reward - rho * tau + (1-done) * Q(s', a')
+        # where rho = (running sum of reward) / (running sum of tau) is the
+        # time-averaged reward rate (NOT a per-step mean). rho only recenters Q
+        # (the actor uses Q-differences, invariant to it) but keeps Q bounded.
         self.rho = 0.0
-        self.rho_lr = getattr(args, 'rho_lr', 1e-3)
+        self.rho_lr = getattr(args, 'rho_lr', 1e-4)
         # ----------------------------------------------------------------------
 
         self.epsilon = 1.0
@@ -71,6 +71,12 @@ class DeepTOP_MDP(object):
     def update_policy(self):
         state_batch, action_batch, reward_batch, \
         next_state_batch, terminal_batch = self.memory.sample_and_split(self.batch_size)
+
+        # reward_batch packs (reward, tau) per transition -> shape (B, 2).
+        # Column 0 is the reward, column 1 is the SMDP step duration tau.
+        reward_col = reward_batch[:, 0:1]
+        tau_col = reward_batch[:, 1:2]
+
         vector_batch = []  # The batch of vector state
         scalar_batch = []  # The batch of scalar state
         next_vector_batch = []
@@ -88,7 +94,8 @@ class DeepTOP_MDP(object):
         next_vector_batch = torch.FloatTensor(np.array(next_vector_batch)).to(self.device)
         next_scalar_batch = torch.FloatTensor(np.array(next_scalar_batch)).to(self.device)
         action_batch = torch.FloatTensor(action_batch).to(self.device)
-        reward_batch = torch.FloatTensor(reward_batch).to(self.device)
+        reward_batch_t = torch.FloatTensor(reward_col).to(self.device)
+        tau_batch = torch.FloatTensor(tau_col).to(self.device)
 
         with torch.no_grad():
             critic_plus = self.critic_target([next_vector_batch,
@@ -104,10 +111,10 @@ class DeepTOP_MDP(object):
                                                 next_scalar_batch,
                                                 next_action_batch])
 
-            # Average-reward (differential) TD target: NO gamma; subtract the
-            # running average reward rho and bootstrap the next differential Q
-            # (masked at episode boundaries, where terminal_batch == 0).
-            target_q_batch = (reward_batch - self.rho
+            # SMDP differential TD target: subtract rho*tau (NOT a constant, and
+            # NO gamma), bootstrap next differential Q (masked at episode
+            # boundaries where terminal_batch == 0).
+            target_q_batch = (reward_batch_t - self.rho * tau_batch
                               + to_tensor(terminal_batch.astype(np.float32)) * next_q_values)
 
         # Critic update
@@ -148,13 +155,16 @@ class DeepTOP_MDP(object):
         self.critic_target.cuda()
 
     def observe(self, r_t, s_t1, done):
+        # r_t is a (reward, tau) pair. rho is the time-averaged reward RATE,
+        # updated by the standard SMDP average-reward rule
+        #     rho <- rho + rho_lr * (reward - rho * tau)
+        # which converges to E[reward]/E[tau]. Kept slow (small rho_lr) so rho is
+        # a stable long-run estimate that is not whipped around by the large
+        # per-episode swings in reward and tau across light vs overloaded loads.
         if self.is_training:
-            # Track the policy's average reward rho via an EMA over the reward
-            # stream. This is the baseline subtracted in the differential TD
-            # target above. Slow enough (rho_lr~1e-3) to be stable, fast enough
-            # to follow the policy as it improves.
-            self.rho += self.rho_lr * (r_t - self.rho)
-            self.memory.append(self.s_t, self.a_t, r_t, done)
+            reward, tau = r_t
+            self.rho += self.rho_lr * (reward - self.rho * tau)
+            self.memory.append(self.s_t, self.a_t, (reward, tau), done)
             self.s_t = s_t1
 
     def random_action(self):
