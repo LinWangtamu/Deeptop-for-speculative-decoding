@@ -19,10 +19,9 @@ def initializeEnv():
     # Episode = 120 s of Poisson arrivals; lambda randomized in [2, 18] each episode.
     env = SpecDecodingEnv(seed=args.seed if args.seed > 0 else 42,
                           duration=120.0, warmup=20.0,
-                          lam_low=1.5, lam_high=7.0,
+                          lam_low=10, lam_high=30.0,
                           true_alpha=0.7,
-                          reward_norm=2.0,
-                          token_norm=1e9)
+                          reward_norm=2.0)
 
 
 def resetEnvs():
@@ -111,7 +110,7 @@ if __name__ == '__main__':
             print(f"  [debug] step {num_step}: state={[round(v,3) for v in next_state]}, "
                   f"action={action[0]}, reward={reward:.4f}")
         # agent observes and updates policy
-        agent.observe(reward, next_state, done)
+        agent.observe((reward, info['tau']), next_state, done)
         if num_step > args.warmup:
             cumulative_reward = cumulative_reward + reward
             agent.update_policy()
