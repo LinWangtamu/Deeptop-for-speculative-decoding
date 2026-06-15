@@ -21,7 +21,7 @@ def initializeEnv():
                           duration=120.0, warmup=20.0,
                           lam_low=10, lam_high=30.0,
                           true_alpha=0.7,
-                          reward_norm=2.0)
+                          reward_norm=5.0)
 
 
 def resetEnvs():
@@ -133,16 +133,17 @@ if __name__ == '__main__':
             state = deepcopy(state)
 
     # ---- after training: inspect learned threshold, save actor ----
-    print('\nLearned threshold over (alpha, backlog) grid:')
-    print('(speculate iff threshold > batch_size/32)')
+    cap = env.max_num_seqs
+    print('\nLearned threshold grid (speculate iff threshold > batch/%d):' % cap)
+    print('(H100: optimal cutoff ~20 at lambda 10-20, -> always-spec at higher load)')
     for alpha in [0.3, 0.5, 0.7, 0.9]:
-        for avg_ctx in [0.3, 0.7]:       # 0.3 = short context, 0.7 = long context
+        for avg_ctx in [0.3, 0.7]:
             for backlog in [0.0, 0.5]:
                 thr = agent.actor.forward(
                     torch.FloatTensor([alpha, avg_ctx, backlog]).to(agent.device)
                 ).cpu().item()
                 print(f'  alpha={alpha} avg_ctx={avg_ctx} backlog={backlog}: '
-                      f'thr={thr:.3f} -> cutoff={thr*32:.1f}')
+                      f'thr={thr:.3f} -> cutoff={thr*cap:.1f}')
 
     torch.save(agent.actor.state_dict(), 'deeptop_spec_actor.pkl')
     print('\nSaved actor to deeptop_spec_actor.pkl')
