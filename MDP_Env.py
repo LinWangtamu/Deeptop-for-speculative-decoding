@@ -190,7 +190,7 @@ class SpecDecodingEnv(gym.Env):
     def __init__(self, seed, duration=120.0, warmup=20.0,
                  lam_low=0.5, lam_high=20.0, true_alpha=0.7,
                  avg_prompt=128.0, avg_decode=128.0,
-                 max_tokens=200000, reward_norm=2.0,
+                 max_tokens=200000, reward_norm=50.0, token_norm=50.0,
                  max_num_seqs=_MAX_NUM_SEQS,
                  max_num_batched_tokens=_MAX_NUM_BATCHED_TOKENS,
                  long_prefill_token_threshold=0,
@@ -207,6 +207,7 @@ class SpecDecodingEnv(gym.Env):
         self.avg_decode = avg_decode
         self.max_tokens = max_tokens
         self.reward_norm = reward_norm
+        self.token_norm = token_norm
 
         # vLLM-style scheduling knobs.
         self.max_num_seqs = max_num_seqs
@@ -221,6 +222,7 @@ class SpecDecodingEnv(gym.Env):
             dtype=np.float32,
         )
         self._holding_cost = 0.0
+        self._tokens_this_step = 0
 
     # ---------- internal helpers ----------
     def _decoding_reqs(self):
@@ -395,6 +397,7 @@ class SpecDecodingEnv(gym.Env):
                 r.num_output_tokens += first
                 r.num_computed_tokens = r.num_prompt_tokens + first
                 r.context_len = r.num_computed_tokens
+                self._tokens_this_step += first
                 if r.is_done:
                     self._retire(r)
 
@@ -405,6 +408,7 @@ class SpecDecodingEnv(gym.Env):
             r.num_output_tokens += adv
             r.num_computed_tokens += adv
             r.context_len = r.num_computed_tokens
+            self._tokens_this_step += adv
             if k > 0:
                 self.at.update(m, v)
             if r.is_done:
@@ -432,6 +436,7 @@ class SpecDecodingEnv(gym.Env):
             raise ValueError("action must be 0 or 1, got {!r}".format(action))
 
         self._holding_cost = 0.0
+        self._tokens_this_step = 0
 
         scheduled = self._schedule()
         self._execute(scheduled, action)
@@ -439,7 +444,13 @@ class SpecDecodingEnv(gym.Env):
         has_work = self._advance_to_work()
         done = not has_work          # episode ends when fully drained
         nextState = self._state()
-        reward = max(-self._holding_cost / self.reward_norm, -1.0)
+        # Token-aware reward: credit output tokens produced THIS step (so the
+        # benefit of speculation is immediate) and charge the holding cost.
+        # With the token term in place, a normal gamma (e.g. 0.99) suffices --
+        # no need for the near-1 gamma that a pure holding-cost reward forces.
+        reward = (self._tokens_this_step / self.token_norm
+                  - self._holding_cost / self.reward_norm)
+        reward = max(reward, -1.0)
 
         info = {
             'lam': self.lam,
@@ -460,6 +471,7 @@ class SpecDecodingEnv(gym.Env):
         self.done_latencies = []
         self.rid = 0
         self._holding_cost = 0.0
+        self._tokens_this_step = 0
 
         self.arrivals = []
         t = 0.0
