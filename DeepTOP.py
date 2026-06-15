@@ -1,5 +1,3 @@
-
-
 import random
 
 import numpy as np
@@ -45,10 +43,24 @@ class DeepTOP_MDP(object):
         # Hyper-parameters
         self.batch_size = args.bsize
         self.tau = args.tau
-        self.discount = args.discount
+        self.discount = args.discount   # NOTE: unused in average-reward mode (kept for compat)
         self.depsilon = 1.0 / args.epsilon
 
-        
+        # --- Average-reward (differential) setup -------------------------------
+        # This task is a long, continuing queueing process whose objective is the
+        # UNDISCOUNTED average reward (== minimize average #-in-system == average
+        # latency, by Little's law). Discounting (gamma=0.99) has a ~100-step
+        # horizon, far shorter than the thousands of steps over which a
+        # speculation decision pays off, so it inverts the sign of the return.
+        # We therefore learn a DIFFERENTIAL value function with TD target
+        #     target = (reward - rho) + (1-done) * Q(s', a')
+        # where rho is a running estimate of the policy's average reward. rho only
+        # recenters Q (the actor uses Q-differences, which are invariant to it),
+        # but it keeps the differential Q bounded.
+        self.rho = 0.0
+        self.rho_lr = getattr(args, 'rho_lr', 1e-3)
+        # ----------------------------------------------------------------------
+
         self.epsilon = 1.0
         self.is_training = True
 
@@ -91,8 +103,12 @@ class DeepTOP_MDP(object):
             next_q_values = self.critic_target([next_vector_batch,
                                                 next_scalar_batch,
                                                 next_action_batch])
-            
-            target_q_batch = reward_batch + self.discount*to_tensor(terminal_batch.astype(np.float32))*next_q_values
+
+            # Average-reward (differential) TD target: NO gamma; subtract the
+            # running average reward rho and bootstrap the next differential Q
+            # (masked at episode boundaries, where terminal_batch == 0).
+            target_q_batch = (reward_batch - self.rho
+                              + to_tensor(terminal_batch.astype(np.float32)) * next_q_values)
 
         # Critic update
         self.critic.zero_grad()
@@ -133,6 +149,11 @@ class DeepTOP_MDP(object):
 
     def observe(self, r_t, s_t1, done):
         if self.is_training:
+            # Track the policy's average reward rho via an EMA over the reward
+            # stream. This is the baseline subtracted in the differential TD
+            # target above. Slow enough (rho_lr~1e-3) to be stable, fast enough
+            # to follow the policy as it improves.
+            self.rho += self.rho_lr * (r_t - self.rho)
             self.memory.append(self.s_t, self.a_t, r_t, done)
             self.s_t = s_t1
 
@@ -156,4 +177,3 @@ class DeepTOP_MDP(object):
 
     def reset(self, obs):
         self.s_t = obs
-
