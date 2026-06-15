@@ -22,7 +22,7 @@ def initializeEnv():
                           lam_low=1.5, lam_high=7.0,
                           true_alpha=0.7,
                           reward_norm=2.0,
-                          token_norm=50.0)
+                          token_norm=1e9)
 
 
 def resetEnvs():
