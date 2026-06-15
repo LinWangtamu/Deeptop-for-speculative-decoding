@@ -12,8 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 
-from MDP_Env import (SpecDecodingEnv, spec_t_decode_step,
-                     _MAX_NUM_SEQS, _K_SPEC)
+from MDP_Env import SpecDecodingEnv, spec_t_decode_step, _K_SPEC
 from model import Actor
 
 THRESHOLD = 10        # fixed stationary threshold baseline
@@ -51,10 +50,13 @@ def run_episode(policy, lam, seed=0, actor=None):
             thr = actor.forward(torch.FloatTensor(vector)).item()
             a = 1 if thr > scalar else 0
         elif policy == 'threshold':
-            batch_size = s[0] * _MAX_NUM_SEQS
+            # s[0] is batch normalized by env.max_num_seqs -> recover raw count.
+            batch_size = s[0] * env.max_num_seqs
             a = 1 if batch_size < THRESHOLD else 0
         elif policy == 'smartspec':
-            batch = env.active[:_MAX_NUM_SEQS]
+            # The decode batch is the set of currently-decoding requests.
+            # running is already capped at max_num_seqs, so no slicing needed.
+            batch = env._decoding_reqs()
             k = max([0, _K_SPEC], key=lambda kk: goodput(batch, kk, env.at.value))
             if k == 0:
                 skip_cnt += 1
@@ -87,6 +89,9 @@ if __name__ == "__main__":
                                      map_location="cpu"))
     actor.eval()
 
+    # Stability boundary for this env is around lambda~6-7 (see diagnose.py);
+    # the sweep spans light load (where SD helps) through overload (where it
+    # hurts) so the policies' crossover behaviour is visible.
     lambdas = [2, 4, 6, 8, 10, 12, 14, 16, 18]
     SEEDS = 5
     names = ["DeepTOP", "Threshold", "SmartSpec", "k=0", "k=5"]
