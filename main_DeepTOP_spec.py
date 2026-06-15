@@ -20,7 +20,8 @@ def initializeEnv():
     env = SpecDecodingEnv(seed=args.seed if args.seed > 0 else 42,
                           duration=120.0, warmup=20.0,
                           lam_low=1.5, lam_high=7.0,
-                          true_alpha=0.7)
+                          true_alpha=0.7,
+                          reward_norm=2.0)
 
 
 def resetEnvs():
