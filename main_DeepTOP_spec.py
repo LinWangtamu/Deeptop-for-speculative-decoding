@@ -18,7 +18,7 @@ def initializeEnv():
     # Episode = 20 s of Poisson arrivals; lambda randomized in [10, 30] each episode.
     env = SpecDecodingEnv(seed=args.seed if args.seed > 0 else 42,
                           duration=20.0, warmup=5.0,
-                          lam_low=10, lam_high=30.0,
+                          lam_low=2, lam_high=18.0,   # span both regimes
                           true_alpha=0.7,
                           reward_norm=5.0)
 
