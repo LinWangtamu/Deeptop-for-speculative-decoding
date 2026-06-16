@@ -109,7 +109,7 @@ _DRAFT_C_SPEC     = 8.41429603e-07   # draft: per spec token generated
 _DRAFT_C_FIXED    = 2.13526175e-03   # draft: fixed per-call overhead
 
 _K_SPEC = 5                     # speculation length when SD is on
-_MAX_NUM_SEQS = 32              # max RUNNING requests (vLLM max_num_seqs cap)
+_MAX_NUM_SEQS = 256             # max RUNNING requests (vLLM max_num_seqs cap)
 _MAX_NUM_BATCHED_TOKENS = 2048  # per-step token budget (vLLM max_num_batched_tokens)
 
 
@@ -238,6 +238,7 @@ class SpecDecodingEnv(gym.Env):
 
     def __init__(self, seed, duration=120.0, warmup=20.0,
                  lam_low=0.5, lam_high=20.0, true_alpha=0.7,
+                 alpha_low=None, alpha_high=None,
                  avg_prompt=128.0, avg_decode=128.0,
                  max_tokens=200000, reward_norm=50.0, token_norm=1e9,
                  reward_clip=None,
@@ -253,6 +254,13 @@ class SpecDecodingEnv(gym.Env):
         self.lam_low = lam_low
         self.lam_high = lam_high
         self.true_alpha = true_alpha
+        # Per-episode acceptance randomization. When both bounds are given,
+        # reset() draws a fresh true_alpha each episode so the agent sees both
+        # the speculate-favorable (high alpha) and speculate-unfavorable (low
+        # alpha) regimes; the alpha_estimate state dim is what it keys off. When
+        # left None, true_alpha stays fixed (controlled eval / backward compat).
+        self.alpha_low = alpha_low
+        self.alpha_high = alpha_high
         self.avg_prompt = avg_prompt
         self.avg_decode = avg_decode
         self.max_tokens = max_tokens
@@ -567,6 +575,9 @@ class SpecDecodingEnv(gym.Env):
             self.rng = np.random.RandomState(seed)
 
         self.lam = float(self.rng.uniform(self.lam_low, self.lam_high))
+        # Re-randomize acceptance rate per episode when a range is configured.
+        if self.alpha_low is not None and self.alpha_high is not None:
+            self.true_alpha = float(self.rng.uniform(self.alpha_low, self.alpha_high))
         self.clock = 0.0
         self.kv = _SpecKVCache(self.max_tokens)
         self.at = _SpecAcceptanceTracker(init=self.true_alpha)
