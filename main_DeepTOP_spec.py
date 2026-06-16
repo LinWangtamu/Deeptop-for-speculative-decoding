@@ -1,4 +1,3 @@
-
 import os
 import torch
 import random
@@ -16,7 +15,7 @@ from DeepTOP import DeepTOP_MDP
 def initializeEnv():
     global env
     # Speculative-decoding serving environment.
-    # Episode = 120 s of Poisson arrivals; lambda randomized in [2, 18] each episode.
+    # Episode = 20 s of Poisson arrivals; lambda randomized in [10, 30] each episode.
     env = SpecDecodingEnv(seed=args.seed if args.seed > 0 else 42,
                           duration=20.0, warmup=5.0,
                           lam_low=10, lam_high=30.0,
@@ -26,7 +25,8 @@ def initializeEnv():
 
 def resetEnvs():
     global state, env
-    state = env.reset()
+    # Gymnasium reset() -> (obs, info)
+    state, _ = env.reset()
 
 
 if __name__ == '__main__':
@@ -103,13 +103,19 @@ if __name__ == '__main__':
         else:
             action = agent.select_action(state)
 
-        # env responds with next_state, reward, terminate_info
-        next_state, reward, done, info = env.step(action[0])
+        # env responds with (obs, reward, terminated, truncated, info)
+        next_state, reward, terminated, truncated, info = env.step(action[0])
+        # `done` drives BOTH the env reset below AND the bootstrap mask the agent
+        # stores. The episode boundary (clock past duration & system drained) is a
+        # genuine cut in the trajectory -- the next state belongs to a fresh
+        # episode with a re-randomized lambda -- so bootstrap is correctly severed
+        # here under the SMDP differential target (no gamma; rho*tau recenters).
+        done = terminated or truncated
         next_state = deepcopy(next_state)
- # === DEBUG: peek at state values ===
+        # === DEBUG: peek at state values ===
         if num_step % 500 == 0:
             print(f"  [debug] step {num_step}: state={[round(v,3) for v in next_state]}, "
-                  f"action={action[0]}, reward={reward:.4f}, rho={agent.rho:.4f}")    
+                  f"action={action[0]}, reward={reward:.4f}, rho={agent.rho:.4f}")
         # agent observes and updates policy
         agent.observe((reward, info['tau']), next_state, done)
         if num_step > args.warmup:
