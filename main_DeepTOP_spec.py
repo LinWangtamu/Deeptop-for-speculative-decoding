@@ -75,6 +75,7 @@ if __name__ == '__main__':
 
     # initialize agent
     hidden = [128, 128]
+    args.rho_lr = 0.02
     agent = DeepTOP_MDP(state_dim, action_dim, hidden, args)
 
     resetEnvs()
