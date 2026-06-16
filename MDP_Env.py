@@ -24,6 +24,12 @@ Scheduling now mirrors vLLM V1's *synchronous* core (no async scheduler):
     effectively never the binding constraint, so incremental KV + preemption
     would be dead code in this regime.
 
+  * Within a step, RUNNING decodes are scheduled BEFORE running prefill chunks,
+    and each decode is budgeted at (1 + k) query tokens to match vLLM's
+    `1 + num_spec_tokens` accounting for the speculative verify pass. This means
+    a cheap decode can never be crowded out of a step by a large prefill chunk,
+    and speculation steps consume budget the way the real system does.
+
 State (a python list; state[0] is the SCALAR compared against the learned
 threshold, state[1:] is the VECTOR fed to the actor):
     state = [ decode_batch / max_num_seqs,   # scalar
@@ -64,6 +70,10 @@ Reward (per step):
 Episode: fixed wall-clock duration with Poisson arrivals; the arrival rate
 lambda is re-randomized every episode (generalization across loads). Episode
 terminates once the clock has passed `duration` and all requests have drained.
+
+Gym API: this env follows the Gymnasium 5-tuple convention --
+    reset() -> (obs, info)
+    step()  -> (obs, reward, terminated, truncated, info)
 """
 
 from collections import deque
@@ -256,6 +266,17 @@ class SpecDecodingEnv(gym.Env):
         self.long_prefill_token_threshold = long_prefill_token_threshold
         self.enable_chunked_prefill = enable_chunked_prefill
 
+        # Fix 3 guard: with every running seq speculating, a step needs
+        # max_num_seqs * (1 + k) query-token budget just for the decodes. If the
+        # budget can't cover that, decodes would be silently dropped from a step
+        # (holding KV, accruing latency, never advancing). Fail loud instead.
+        if self.max_num_seqs * (1 + _K_SPEC) > self.max_num_batched_tokens:
+            raise ValueError(
+                "max_num_batched_tokens ({}) must be >= max_num_seqs*(1+k) ({}) "
+                "so running decodes never starve when all seqs speculate".format(
+                    self.max_num_batched_tokens,
+                    self.max_num_seqs * (1 + _K_SPEC)))
+
         self.action_space = spaces.Discrete(2)
         self.observation_space = spaces.Box(
             low=np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
@@ -297,30 +318,48 @@ class SpecDecodingEnv(gym.Env):
             self.rid += 1
 
     # ---------- vLLM-style scheduling ----------
-    def _schedule(self):
+    def _schedule(self, k=0):
         """Form one unified batch the way vLLM Scheduler.schedule() does.
 
         Returns a list of (request, num_new_tokens) pairs. `num_new_tokens` is
         the number of QUERY tokens this request contributes to the forward pass
-        (1 for a decode, or the prefill-chunk size for a prefill).
+        (for a decode this is the budget charge (1 + k), not the realized token
+        advance -- `_execute` ignores it for decoders and drives advancement
+        from the acceptance logic; for a prefill it is the chunk size).
+
+        `k` is the speculation length chosen this step. A running decode is
+        budgeted at (1 + k) query tokens -- the single decode token plus the k
+        speculative tokens the verify pass must process -- matching vLLM's
+        `1 + num_spec_tokens` accounting.
+
+        Decodes are scheduled BEFORE running prefill chunks so a cheap decode is
+        never crowded out of a step by a large prefill chunk.
         """
         token_budget = self.max_num_batched_tokens
         scheduled = []
+        per_decode = 1 + k
 
-        # 1) Schedule RUNNING requests first (decodes + continuing prefill chunks).
+        # 1a) RUNNING decodes FIRST: cheap, prioritized, must never starve.
         for r in self.running:
+            if not r.is_decoding:
+                continue
+            if token_budget < per_decode:
+                # Can't fit even one decode -> misconfiguration; the __init__
+                # guard should already have caught this.
+                break
+            scheduled.append((r, per_decode))
+            token_budget -= per_decode
+
+        # 1b) RUNNING prefill continuations fill whatever budget remains.
+        for r in self.running:
+            if r.is_decoding:
+                continue
             if token_budget <= 0:
                 break
-            if r.is_decoding:
-                # Decode: a single query token (speculation is handled in the
-                # latency / token-advance logic, not by inflating num_new here).
-                num_new = 1
-            else:
-                # Continue prefilling this request's prompt.
-                num_new = r.num_prompt_tokens - r.num_computed_tokens
-                thr = self.long_prefill_token_threshold
-                if 0 < thr < num_new:
-                    num_new = thr
+            num_new = r.num_prompt_tokens - r.num_computed_tokens
+            thr = self.long_prefill_token_threshold
+            if 0 < thr < num_new:
+                num_new = thr
             num_new = min(num_new, token_budget)
             if num_new <= 0:
                 continue
@@ -473,19 +512,25 @@ class SpecDecodingEnv(gym.Env):
 
     # ---------- gym API ----------
     def step(self, action):
-        """One unified scheduler step of the serving system."""
-        if not self.action_space.contains(action):
+        """One unified scheduler step of the serving system.
+
+        Gymnasium 5-tuple: returns (obs, reward, terminated, truncated, info).
+        """
+        action = int(action)  # coerce np.int64 -> int (avoids spaces.contains quirks)
+        if action not in (0, 1):
             raise ValueError("action must be 0 or 1, got {!r}".format(action))
 
         self._holding_cost = 0.0
         self._tokens_this_step = 0
         t_before = self.clock
 
-        scheduled = self._schedule()
+        k = _K_SPEC if action == 1 else 0
+        scheduled = self._schedule(k)
         self._execute(scheduled, action)
 
         has_work = self._advance_to_work()
-        done = not has_work          # episode ends when fully drained
+        terminated = not has_work    # natural terminal: episode fully drained
+        truncated = False            # no time-limit truncation in this env
         nextState = self._state()
         # Holding-cost reward (Little's-law latency proxy). The token term is
         # off by default (token_norm large) so this is pure -holding/reward_norm;
@@ -510,10 +555,17 @@ class SpecDecodingEnv(gym.Env):
             'mean_latency': (float(np.mean(self.done_latencies))
                              if self.done_latencies else None),
         }
-        return nextState, reward, done, info
+        return nextState, reward, terminated, truncated, info
 
-    def reset(self):
-        """New episode with a freshly randomized arrival rate."""
+    def reset(self, *, seed=None, options=None):
+        """New episode with a freshly randomized arrival rate.
+
+        Gymnasium signature: reset(seed=None, options=None) -> (obs, info).
+        """
+        if seed is not None:
+            self.seed_val = seed
+            self.rng = np.random.RandomState(seed)
+
         self.lam = float(self.rng.uniform(self.lam_low, self.lam_high))
         self.clock = 0.0
         self.kv = _SpecKVCache(self.max_tokens)
@@ -537,4 +589,4 @@ class SpecDecodingEnv(gym.Env):
         self.ai = 0
 
         self._advance_to_work()
-        return self._state()
+        return self._state(), {}
