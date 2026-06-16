@@ -36,7 +36,7 @@ def run_episode(policy, lam, seed=0, actor=None):
     policy: 'deeptop' | 'threshold' | 'smartspec' | 'k0' | 'k5'
     Runs one full episode at a FIXED lambda; returns mean latency.
     """
-    env = SpecDecodingEnv(seed=seed, duration=120.0, warmup=20.0,
+    env = SpecDecodingEnv(seed=seed, duration=20.0, warmup=5.0,
                           lam_low=lam, lam_high=lam, true_alpha=0.7)
     s = env.reset()
     skip_cnt = 0
@@ -92,7 +92,7 @@ if __name__ == "__main__":
     # Stability boundary for this env is around lambda~6-7 (see diagnose.py);
     # the sweep spans light load (where SD helps) through overload (where it
     # hurts) so the policies' crossover behaviour is visible.
-    lambdas = [2, 4, 6, 8, 10, 12, 14, 16, 18]
+    lambdas = [10, 15, 20, 25, 30, 35, 40]
     SEEDS = 5
     names = ["DeepTOP", "Threshold", "SmartSpec", "k=0", "k=5"]
     keys = ["deeptop", "threshold", "smartspec", "k0", "k5"]
