@@ -38,7 +38,8 @@ def run_episode(policy, lam, seed=0, actor=None):
     """
     env = SpecDecodingEnv(seed=seed, duration=20.0, warmup=5.0,
                           lam_low=lam, lam_high=lam, true_alpha=0.7)
-    s = env.reset()
+    # Gymnasium reset() -> (obs, info)
+    s, _ = env.reset()
     skip_cnt = 0
     done = False
     steps = 0
@@ -69,7 +70,9 @@ def run_episode(policy, lam, seed=0, actor=None):
             a = 0
         elif policy == 'k5':
             a = 1
-        s, r, done, info = env.step(a)
+        # Gymnasium step() -> (obs, reward, terminated, truncated, info)
+        s, r, terminated, truncated, info = env.step(a)
+        done = terminated or truncated
         steps += 1
     return info.get('mean_latency')
 
@@ -89,10 +92,11 @@ if __name__ == "__main__":
                                      map_location="cpu"))
     actor.eval()
 
-    # Stability boundary for this env is around lambda~6-7 (see diagnose.py);
-    # the sweep spans light load (where SD helps) through overload (where it
-    # hurts) so the policies' crossover behaviour is visible.
-    lambdas = [10, 15, 20, 25, 30, 35, 40]
+    # Sweep spans light load (below the ~6-7 stability boundary, where SD helps)
+    # through overload (where the queue dominates), so the policies' crossover
+    # behaviour is visible. Earlier sweeps started at 10 (all overload) and hid
+    # the light-load regime where speculation pays off.
+    lambdas = [2, 6, 20, 40, 80, 120, 160, 200]
     SEEDS = 5
     names = ["DeepTOP", "Threshold", "SmartSpec", "k=0", "k=5"]
     keys = ["deeptop", "threshold", "smartspec", "k0", "k5"]
