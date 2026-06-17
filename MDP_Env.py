@@ -20,7 +20,7 @@ Scheduling now mirrors vLLM V1's *synchronous* core (no async scheduler):
 
   * KV is still reserved UP FRONT (prompt_len + decode_len) when a request is
     first admitted to RUNNING, and there is NO preemption. This is a deliberate
-    simplification: with max_num_seqs=32 and a 200k-token pool the KV ceiling is
+    simplification: with max_num_seqs=256 and a 200k-token pool the KV ceiling is
     effectively never the binding constraint, so incremental KV + preemption
     would be dead code in this regime.
 
