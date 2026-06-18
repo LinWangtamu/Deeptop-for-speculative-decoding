@@ -294,7 +294,8 @@ class SpecDecodingEnv(gym.Env):
                  max_num_seqs=_MAX_NUM_SEQS,
                  max_num_batched_tokens=_MAX_NUM_BATCHED_TOKENS,
                  long_prefill_token_threshold=0,
-                 enable_chunked_prefill=True):
+                 enable_chunked_prefill=True,
+                 backlog_scale=50.0):
         super(SpecDecodingEnv, self).__init__()
         self.seed_val = seed
         self.rng = np.random.RandomState(seed)
@@ -310,6 +311,7 @@ class SpecDecodingEnv(gym.Env):
         # left None, true_alpha stays fixed (controlled eval / backward compat).
         self.alpha_low = alpha_low
         self.alpha_high = alpha_high
+        self.backlog_scale = backlog_scale
         self.avg_prompt = avg_prompt
         self.avg_decode = avg_decode
         self.max_tokens = max_tokens
@@ -323,10 +325,11 @@ class SpecDecodingEnv(gym.Env):
         self.long_prefill_token_threshold = long_prefill_token_threshold
         self.enable_chunked_prefill = enable_chunked_prefill
 
-        # Fix 3 guard: with every running seq speculating, a step needs
+        # with every running seq speculating, a step needs
         # max_num_seqs * (1 + k) query-token budget just for the decodes. If the
         # budget can't cover that, decodes would be silently dropped from a step
         # (holding KV, accruing latency, never advancing). Fail loud instead.
+        ## Guard: token budget must cover all decoders speculating
         if self.max_num_seqs * (1 + _K_SPEC) > self.max_num_batched_tokens:
             raise ValueError(
                 "max_num_batched_tokens ({}) must be >= max_num_seqs*(1+k) ({}) "
@@ -363,7 +366,9 @@ class SpecDecodingEnv(gym.Env):
             float(min(bs, self.max_num_seqs)) / self.max_num_seqs,  # scalar
             float(self.at.value),                                   # vector[0]: alpha
             float(avg_ctx) / 256.0,                                 # vector[1]: avg ctx
-            float(min(backlog, 50)) / 50.0,                         # vector[2]: backlog
+            # float(min(backlog, 50)) / 50.0, 
+            float(backlog / (backlog + self.backlog_scale)),       # vector[2]: backlog
+         # we force it to be [0,1], but it hurts because when backlog = 500 or backlog = 50 are totally different, here we should not consider them equal.
         ]
 
     def _drain(self):
@@ -393,12 +398,28 @@ class SpecDecodingEnv(gym.Env):
         never crowded out of a step by a large prefill chunk.
         """
         token_budget = self.max_num_batched_tokens
-        scheduled = []
+        scheduled = [] # return batch:[request,num_new_tokens,...]
         per_decode = 1 + k
+"""
+Each element is (request_object, num_new_tokens)
+num_new_tokens = QUERY-token budget this request occupies in the forward pass
+
+scheduled = [
+    # ---- Running decodes (scheduled FIRST, each charged 1 + k = 6) ----
+    (req_A, 6),   # req_A is a _SpecRequest object; 6 = 1 decode token + 5 spec tokens
+    (req_B, 6),   # req_B: same budget charge (the verify pass must process 6 positions)
+    (req_C, 6),   # req_C: note 6 is the BUDGET, not how many tokens it will actually advance
+                  #        (_execute decides real advance from acceptance: anywhere 0..6)
+
+    # ---- Running prefill chunk (scheduled AFTER decodes, with leftover budget) ----
+    (req_D, 64),  # req_D: 64 = chunk size = 64 prompt tokens fed this step
+                  #        for prefill, num_new_tokens IS the real work done
+]
+"""      
 
         # 1a) RUNNING decodes FIRST: cheap, prioritized, must never starve.
-        for r in self.running:
-            if not r.is_decoding:
+        for r in self.running: #enumerate all the running requests
+            if not r.is_decoding:# skip the request that is in the prefill phase
                 continue
             if token_budget < per_decode:
                 # Can't fit even one decode -> misconfiguration; the __init__
@@ -411,11 +432,11 @@ class SpecDecodingEnv(gym.Env):
         for r in self.running:
             if r.is_decoding:
                 continue
-            if token_budget <= 0:
+            if token_budget <= 0:# if decode already use up the budget, stop 
                 break
-            num_new = r.num_prompt_tokens - r.num_computed_tokens
+            num_new = r.num_prompt_tokens - r.num_computed_tokens# how many prefill token left 
             thr = self.long_prefill_token_threshold
-            if 0 < thr < num_new:
+            if 0 < thr < num_new:# if the left token is larger than thr, only take the thr token
                 num_new = thr
             num_new = min(num_new, token_budget)
             if num_new <= 0:
@@ -426,9 +447,9 @@ class SpecDecodingEnv(gym.Env):
         # 2) Schedule WAITING requests (admission + new prefills).
         #    Respect the running cap and the token budget. No preemption.
         while self.waiting and token_budget > 0:
-            if len(self.running) >= self.max_num_seqs:
+            if len(self.running) >= self.max_num_seqs:# if running request large than max_num_seqs, stop
                 break
-            r = self.waiting[0]
+            r = self.waiting[0]# take the first waiting request and check some condition afterwards
 
             # Up-front full-sequence KV reservation at admission time.
             need = r.prompt_len + r.decode_len
@@ -453,10 +474,10 @@ class SpecDecodingEnv(gym.Env):
             num_new = min(num_new, token_budget)
             if num_new <= 0:
                 break
-
-            self.kv.allocate(need)
-            self.waiting.popleft()
-            self.running.append(r)
+#after checking all the conditions right, we do:
+            self.kv.allocate(need) #reserve kv cache
+            self.waiting.popleft() #pop off from the waiting queue
+            self.running.append(r)#add to running
             scheduled.append((r, num_new))
             token_budget -= num_new
 
@@ -547,7 +568,7 @@ class SpecDecodingEnv(gym.Env):
             r.num_computed_tokens += adv
             r.context_len = r.num_computed_tokens
             self._tokens_this_step += adv
-            if k > 0:
+            if k > 0: #only update acc when do sd
                 self.at.update(m, v)
             if r.is_done:
                 self._retire(r)
