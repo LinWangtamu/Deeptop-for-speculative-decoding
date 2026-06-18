@@ -1,17 +1,17 @@
 """
 Speculative Decoding serving environment for DeepTOP.
 
-Scheduling now mirrors vLLM V1's *synchronous* core (no async scheduler):
+Scheduling now mirrors vLLM V1's *synchronous* core from vllm-project/vllm/blob/main/vllm/v1/core/sched/scheduler.py:
 
   * No prefill / decode "phase" split. Each step forms ONE unified batch that
     can mix decode tokens (1 query token per decoding seq) AND prefill chunks,
     all sharing a single `max_num_batched_tokens` budget -- exactly like
     vllm Scheduler.schedule(): it first packs RUNNING requests, then admits
-    WAITING requests until the budget or the running cap is hit.
+    WAITING requests until the token budget or the running cap max_num_seqs is hit.
 
   * `max_num_seqs` is a hard cap on the number of RUNNING requests, enforced at
     admission time (the waiting->running gate). It is NOT a post-hoc slice of
-    an unbounded `active` list anymore, so the 33rd request truly waits instead
+    an unbounded `active` list anymore, so the 257th (max_num_seqs=256) request truly waits instead
     of sitting in the batch holding KV while never decoding.
 
   * Long prompts are CHUNKED across steps: if a prompt does not fit the
@@ -23,6 +23,8 @@ Scheduling now mirrors vLLM V1's *synchronous* core (no async scheduler):
     simplification: with max_num_seqs=256 and a 200k-token pool the KV ceiling is
     effectively never the binding constraint, so incremental KV + preemption
     would be dead code in this regime.
+    
+    #need verify (avg_prompt = avg_decode =128, total max tokens 65536, much less than 200k)
 
   * Within a step, RUNNING decodes are scheduled BEFORE running prefill chunks,
     and each decode is budgeted at (1 + k) query tokens to match vLLM's
@@ -30,16 +32,19 @@ Scheduling now mirrors vLLM V1's *synchronous* core (no async scheduler):
     a cheap decode can never be crowded out of a step by a large prefill chunk,
     and speculation steps consume budget the way the real system does.
 
-State (a python list; state[0] is the SCALAR compared against the learned
-threshold, state[1:] is the VECTOR fed to the actor):
-    state = [ decode_batch / max_num_seqs,   # scalar
+State (a Python list; state[0] is the SCALAR compared against the learned
+threshold, state[1:] is the vector fed to the actor to learn the threshold):
+    state = [ decode_batch / max_num_seqs,   # scalar [0,1] empty load to heavy load
               alpha_estimate,                # vector[0]
-              average_context / 256,         # vector[1]
-              backlog / 50 ]                 # vector[2]
+              average_context / 256,         # vector[1]  
+              #(avg_prompt + avg_decode =256) need to change when we change the avg length
+              backlog / 50 ]                 # vector[2] ##?? need finetune
 
-  decode_batch : number of RUNNING requests currently in the decode phase
-                 (this is the set the speculate/no-speculate action acts on)
-  backlog      : len(waiting) + (#running still prefilling)
+  decode_batch: number of RUNNING requests currently in the decode phase
+                 (this is the set the speculate/no-speculate action acts on and directly affects the reward, which is why select it as the threshold )
+                 why not num_in_system: sd or not does not affect them directly
+                 why not running request number(currently prefill + decode): prefill is affect by the token budget and chunksize not on sd.
+  backlog     : len(waiting) + (#running still prefilling) exclude the decode batch, decouple with the scalar, this is kind of future load forecast.
 
 Action: 1 -> speculate this step (k=5);  0 -> normal decode (k=0)
 
@@ -48,16 +53,16 @@ The learned DeepTOP policy is:
                   > normalized_decode_batch
 
 Reward (per step):
-    reward = tokens_this_step / token_norm  -  holding_cost / reward_norm
+    reward = tokens_this_step / token_norm(diable by default)  -  holding_cost / reward_norm
 
     The holding cost (sum over the step of step_latency * #-in-system) is the
     classic queueing proxy for latency: by Little's law its long-run average is
     proportional to mean E2E latency. The holding cost of a step covers the
-    WHOLE unified forward pass (prefill chunks + decode), since prefill is no
+    whole unified forward pass (prefill chunks + decode), since prefill is no
     longer a separate clock advance.
 
     This task is trained with the AVERAGE-REWARD objective (no discounting): the
-    speculate-or-not decision pays off (faster drain -> lower future holding)
+    speculate-or-not decision pays off (sd enable faster drain -> lower future holding)
     over thousands of steps, a horizon that any gamma < 1 discounts away, so a
     discounted return inverts the sign of the optimum. Under average reward,
     maximizing mean per-step reward == minimizing mean #-in-system == minimizing
@@ -70,10 +75,13 @@ Reward (per step):
 Episode: fixed wall-clock duration with Poisson arrivals; the arrival rate
 lambda is re-randomized every episode (generalization across loads). Episode
 terminates once the clock has passed `duration` and all requests have drained.
+make an action is one step
 
+#our SpecDecodingEnv obeys the gym rule to  
 Gym API: this env follows the Gymnasium 5-tuple convention --
-    reset() -> (obs, info)
+    reset() -> (obs, info) #reset the env(resample \lambda, \alpha, generate new arrival, dequeue) 
     step()  -> (obs, reward, terminated, truncated, info)
+    obs, reward, terminated, truncated, info = env.step(action)# move one step, agent feed to env, and env return 5-tuple to agent
 """
 
 from collections import deque
@@ -90,7 +98,7 @@ except ImportError:
 
 # =============================================================================
 # Latency model: H100, fitted. Two forward kinds.
-#   target_fwd(n_kv, n_query) = c_fixed + c_kv * N_kv + c_compute * N_query
+#   target_fwd(n_kv, n_query) = c_fixed + c_kv * N_kv + c_compute * N_query #fixed overhead + load kv cache + compute token
 #       big model; N_kv = total context (KV) attended, N_query = query tokens.
 #   draft_step(n_kv, n_spec)  = c_fixed + c_kv * N_kv + c_spec * N_spec
 #       small model run ONCE to produce n_spec draft tokens (KV is reused across
@@ -123,9 +131,9 @@ def draft_step(n_kv, n_spec):
     return _DRAFT_C_FIXED + _DRAFT_C_KV * n_kv + _DRAFT_C_SPEC * n_spec
 
 
-# Backward-compat alias: spec_t_fwd historically meant a target forward pass.
-def spec_t_fwd(nc, nb):
-    return target_fwd(nc, nb)
+# # Backward-compat alias: spec_t_fwd historically meant a target forward pass.
+# def spec_t_fwd(nc, nb):
+#     return target_fwd(nc, nb)
 
 
 def spec_t_decode_step(batch, k):
@@ -142,8 +150,8 @@ def spec_t_decode_step(batch, k):
     return draft_step(n_kv, k * bs) + target_fwd(n_kv, bs * (k + 1))
 
 
-def spec_t_prefill(pl):
-    return target_fwd(0, pl)
+# def spec_t_prefill(pl):
+#     return target_fwd(0, pl)
 
 
 # =============================================================================
@@ -152,7 +160,7 @@ def spec_t_prefill(pl):
 class _SpecRequest(object):
     """vLLM-style request bookkeeping.
 
-    A request is PREFILLING while num_computed_tokens < num_prompt_tokens and
+    A request is PREFILLING while num_computed_tokens(current prefill token number) < num_prompt_tokens and
     DECODING once it has caught up. context_len tracks the KV size it attends
     to and stays equal to num_computed_tokens.
     """
@@ -196,27 +204,68 @@ class _SpecKVCache(object):
     def free(self, n):
         self.used_tokens = max(0, self.used_tokens - n)
 
+##change the logit to let deeptop adjust to different alpha
+# class _SpecAcceptanceTracker(object):
+#     """Definition A: alpha = total accepted / total VERIFIED tokens (moving window)."""
+
+#     def __init__(self, window=20, init=0.7):
+#         self._buf = [(init, 1.0)] * (window // 2)
+#         self._w = window
+
+#     def update(self, acc, ver):
+#         if ver > 0:
+#             self._buf.append((float(acc), float(ver)))
+#             if len(self._buf) > self._w:
+#                 self._buf.pop(0)
+
+#     @property
+#     def value(self):
+#         ta = sum(a for a, _ in self._buf)
+#         tv = sum(v for _, v in self._buf)
+#         return ta / tv if tv > 0 else 0.7
+
+# new alpha estimator
 
 class _SpecAcceptanceTracker(object):
-    """Definition A: alpha = total accepted / total VERIFIED tokens (moving window)."""
+    """Definition A: alpha = total accepted / total VERIFIED tokens (moving window).
 
-    def __init__(self, window=20, init=0.7):
-        self._buf = [(init, 1.0)] * (window // 2)
+    Exploration-honest version: the prior does NOT leak the episode's true_alpha.
+    The agent starts from a fixed, episode-independent prior and can only learn
+    the real acceptance rate by actually speculating (k>0). This mirrors a real
+    serving system, where acceptance can only be measured by running the drafter.
+
+    `prior` is a fixed optimistic estimate (default 0.9) so that, under
+    uncertainty, speculating looks attractive -- this pushes the agent to explore
+    (optimism in the face of uncertainty) instead of never speculating and thus
+    never observing alpha. Set prior lower for a more neutral start.
+
+    `prior_weight` controls how many synthetic prior samples seed the buffer:
+    larger -> the prior persists longer before real data dominates; smaller ->
+    real observations take over faster (stronger exploration pressure).
+    """
+
+    def __init__(self, window=20, prior=0.9, prior_weight=2):
         self._w = window
+        self._prior = float(prior)
+        # Seed with `prior_weight` synthetic records, each worth 1 verified
+        # token, encoding the prior acceptance rate. These get flushed out of the
+        # moving window as real (k>0) observations arrive.
+        self._buf = deque(
+            [(self._prior, 1.0)] * max(0, prior_weight),
+            maxlen=window,
+        )
 
     def update(self, acc, ver):
+        # Only real speculative steps (ver>0) carry information. With a bounded
+        # deque, append auto-evicts the oldest record once full.
         if ver > 0:
             self._buf.append((float(acc), float(ver)))
-            if len(self._buf) > self._w:
-                self._buf.pop(0)
 
     @property
     def value(self):
         ta = sum(a for a, _ in self._buf)
         tv = sum(v for _, v in self._buf)
-        return ta / tv if tv > 0 else 0.7
-
-
+        return ta / tv if tv > 0 else self._prior
 def spec_simulate_acceptance(k, true_alpha, rng):
     """Returns (m, n_verified). Early-stop at first rejection."""
     if k == 0:
@@ -469,8 +518,8 @@ class SpecDecodingEnv(gym.Env):
 
         k = _K_SPEC if action == 1 else 0
         step_t = self._unified_step_latency(decoders, prefills, k)
-
-        self._holding_cost += step_t * n_in_system
+       # Little's law: N=\lambda*T, when \lambda fix, T is linear with N, we want to minimize \ sum (step_t*n_in_system), the sum of weighted N 
+        self._holding_cost += step_t * n_in_system 
         self.clock += step_t
 
         # --- advance prefill chunks (no speculation on prefill) ---
@@ -580,7 +629,7 @@ class SpecDecodingEnv(gym.Env):
             self.true_alpha = float(self.rng.uniform(self.alpha_low, self.alpha_high))
         self.clock = 0.0
         self.kv = _SpecKVCache(self.max_tokens)
-        self.at = _SpecAcceptanceTracker(init=self.true_alpha)
+        self.at = _SpecAcceptanceTracker(window=20, prior=0.9, prior_weight=2)
         self.waiting = deque()
         self.running = []
         self.done_latencies = []
