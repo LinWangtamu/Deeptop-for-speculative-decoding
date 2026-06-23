@@ -57,6 +57,10 @@ if __name__ == '__main__':
     parser.add_argument('--seed', default=458472, type=int, help='')
     parser.add_argument('--resume', default='default', type=str, help='Resuming model path for testing')
     parser.add_argument('--total_steps', default=200000, type=int, help='total training steps')
+    parser.add_argument('--reward_mode', default='average', type=str,
+                        choices=['average', 'discounted'],
+                        help='ABLATION: average-reward SMDP differential target (default) '
+                             'vs discounted return (per-decision gamma from --discount)')
 
     args = parser.parse_args()
 
@@ -78,6 +82,8 @@ if __name__ == '__main__':
     hidden = [128, 128]
     args.rho_lr = 0.02
     agent = DeepTOP_MDP(state_dim, action_dim, hidden, args)
+    print(f'[ablation] reward_mode = {args.reward_mode}'
+          + (f' (gamma={args.discount})' if args.reward_mode == 'discounted' else ''))
 
     resetEnvs()
     agent.reset(state)
@@ -153,5 +159,6 @@ if __name__ == '__main__':
                 print(f'  alpha={alpha} avg_ctx={avg_ctx} backlog={backlog}: '
                       f'thr={thr:.3f} -> cutoff={thr*cap:.1f}')
 
-    torch.save(agent.actor.state_dict(), 'deeptop_spec_actor.pkl')
-    print('\nSaved actor to deeptop_spec_actor.pkl')
+    out_path = f'deeptop_spec_actor_{args.reward_mode}.pkl'
+    torch.save(agent.actor.state_dict(), out_path)
+    print(f'\nSaved actor to {out_path}')
