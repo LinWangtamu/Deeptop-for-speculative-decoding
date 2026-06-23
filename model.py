@@ -41,7 +41,8 @@ class Actor(nn.Module):
         # Bound the threshold to (0,1) so it stays comparable to the normalized
         # scalar state (batch/max_num_seqs in [0,1]) and the actor cannot diverge.
         return torch.sigmoid(out)
-     def print_num_params(self): 
+
+    def print_num_params(self): 
         total_params = sum(p.numel() for p in self.parameters())
         total_params_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
