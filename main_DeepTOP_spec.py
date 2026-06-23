@@ -17,7 +17,7 @@ def initializeEnv():
     # Speculative-decoding serving environment.
     # Episode = 20 s of Poisson arrivals; lambda randomized in [10, 30] each episode.
     env = SpecDecodingEnv(seed=args.seed if args.seed > 0 else 42,
-                          duration=20.0, warmup=5.0,
+                          duration=120.0, warmup=20.0,
                           lam_low=2, lam_high=150.0,  # span light -> saturated (batch crossover)
                           true_alpha=0.7,
                           alpha_low=0.3, alpha_high=0.9,  # randomize acceptance per episode
