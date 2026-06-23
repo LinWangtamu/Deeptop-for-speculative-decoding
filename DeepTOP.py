@@ -61,6 +61,15 @@ class DeepTOP_MDP(object):
         self.rho_lr = getattr(args, 'rho_lr', 1e-4)
         # ----------------------------------------------------------------------
 
+        # --- ABLATION: reward objective -------------------------------------
+        # 'average'    -> SMDP differential target (default, paper setting):
+        #                 target = reward - rho*tau + (1-done)*Q(s',a')
+        # 'discounted' -> standard discounted return (per-decision gamma, tau
+        #                 ignored, rho disabled):
+        #                 target = reward + gamma*(1-done)*Q(s',a')
+        self.reward_mode = getattr(args, 'reward_mode', 'average')
+        # ----------------------------------------------------------------------
+
         self.epsilon = 1.0
         self.is_training = True
 
@@ -114,8 +123,18 @@ class DeepTOP_MDP(object):
             # SMDP differential TD target: subtract rho*tau (NOT a constant, and
             # NO gamma), bootstrap next differential Q (masked at episode
             # boundaries where terminal_batch == 0).
-            target_q_batch = (reward_batch_t - self.rho * tau_batch
-                              + to_tensor(terminal_batch.astype(np.float32)) * next_q_values)
+            if self.reward_mode == 'discounted':
+                # ABLATION: standard discounted return. Plain per-decision gamma,
+                # tau ignored, rho not subtracted. This is the discounted-RL
+                # baseline that the average-reward formulation is compared against.
+                target_q_batch = (reward_batch_t
+                                  + self.discount
+                                  * to_tensor(terminal_batch.astype(np.float32))
+                                  * next_q_values)
+            else:
+                # Default: average-reward SMDP differential target.
+                target_q_batch = (reward_batch_t - self.rho * tau_batch
+                                  + to_tensor(terminal_batch.astype(np.float32)) * next_q_values)
 
         # Critic update
         self.critic.zero_grad()
@@ -163,7 +182,9 @@ class DeepTOP_MDP(object):
         # per-episode swings in reward and tau across light vs overloaded loads.
         if self.is_training:
             reward, tau = r_t
-            self.rho += self.rho_lr * (reward - self.rho * tau)
+            if self.reward_mode == 'average':
+                self.rho += self.rho_lr * (reward - self.rho * tau)
+            # (discounted mode: rho stays 0 and is unused)
             self.memory.append(self.s_t, self.a_t, (reward, tau), done)
             self.s_t = s_t1
 
