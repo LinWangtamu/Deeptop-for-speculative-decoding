@@ -36,7 +36,7 @@ def run_episode(policy, lam, seed=0, actor=None):
     policy: 'deeptop' | 'threshold' | 'smartspec' | 'k0' | 'k5'
     Runs one full episode at a FIXED lambda; returns mean latency.
     """
-    env = SpecDecodingEnv(seed=seed, duration=20.0, warmup=5.0,
+    env = SpecDecodingEnv(seed=seed, duration=120.0, warmup=20.0,
                           lam_low=lam, lam_high=lam, true_alpha=0.7)
     # Gymnasium reset() -> (obs, info)
     s, _ = env.reset()
