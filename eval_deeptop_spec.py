@@ -87,8 +87,14 @@ def avg(policy, lam, seeds=5, actor=None):
 
 
 if __name__ == "__main__":
+    import argparse
+    _p = argparse.ArgumentParser()
+    _p.add_argument("--actor", default="deeptop_spec_actor_average.pkl",
+                    help="path to the trained actor .pkl (per ablation mode)")
+    _args = _p.parse_args()
+
     actor = Actor(3, 1, [128, 128])
-    actor.load_state_dict(torch.load("deeptop_spec_actor.pkl",
+    actor.load_state_dict(torch.load(_args.actor,
                                      map_location="cpu"))
     actor.eval()
 
