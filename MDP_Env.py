@@ -1,4 +1,4 @@
-"""
+r"""
 Speculative Decoding serving environment for DeepTOP.
 
 Scheduling now mirrors vLLM V1's *synchronous* core from vllm-project/vllm/blob/main/vllm/v1/core/sched/scheduler.py:
