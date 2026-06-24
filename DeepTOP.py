@@ -68,6 +68,10 @@ class DeepTOP_MDP(object):
         #                 ignored, rho disabled):
         #                 target = reward + gamma*(1-done)*Q(s',a')
         self.reward_mode = getattr(args, 'reward_mode', 'average')
+        # --- ABLATION: SMDP vs MDP (only meaningful when reward_mode=='average')
+        # True  -> SMDP: time-averaged rate, target subtracts rho*tau
+        # False -> MDP : per-step average, target subtracts rho (tau ignored)
+        self.smdp = getattr(args, 'smdp', True)
         # ----------------------------------------------------------------------
 
         self.epsilon = 1.0
@@ -132,9 +136,15 @@ class DeepTOP_MDP(object):
                                   * to_tensor(terminal_batch.astype(np.float32))
                                   * next_q_values)
             else:
-                # Default: average-reward SMDP differential target.
-                target_q_batch = (reward_batch_t - self.rho * tau_batch
-                                  + to_tensor(terminal_batch.astype(np.float32)) * next_q_values)
+                # Average-reward. ABLATION SMDP vs MDP:
+                if self.smdp:
+                    # SMDP: time-averaged, subtract rho*tau (default).
+                    target_q_batch = (reward_batch_t - self.rho * tau_batch
+                                      + to_tensor(terminal_batch.astype(np.float32)) * next_q_values)
+                else:
+                    # MDP: per-step average, subtract rho (tau ignored).
+                    target_q_batch = (reward_batch_t - self.rho
+                                      + to_tensor(terminal_batch.astype(np.float32)) * next_q_values)
 
         # Critic update
         self.critic.zero_grad()
@@ -183,7 +193,10 @@ class DeepTOP_MDP(object):
         if self.is_training:
             reward, tau = r_t
             if self.reward_mode == 'average':
-                self.rho += self.rho_lr * (reward - self.rho * tau)
+                if self.smdp:
+                    self.rho += self.rho_lr * (reward - self.rho * tau)  # rate E[r]/E[tau]
+                else:
+                    self.rho += self.rho_lr * (reward - self.rho)        # per-step mean E[r]
             # (discounted mode: rho stays 0 and is unused)
             self.memory.append(self.s_t, self.a_t, (reward, tau), done)
             self.s_t = s_t1
