@@ -17,7 +17,7 @@ def initializeEnv():
     # Speculative-decoding serving environment.
     # Episode = 20 s of Poisson arrivals; lambda randomized in [10, 30] each episode.
     env = SpecDecodingEnv(seed=args.seed if args.seed > 0 else 42,
-                          duration=120.0, warmup=20.0,
+                          duration=20.0, warmup=5.0,
                           lam_low=2, lam_high=150.0,  # span light -> saturated (batch crossover)
                           true_alpha=0.7,
                           alpha_low=0.3, alpha_high=0.9,  # randomize acceptance per episode
@@ -61,8 +61,15 @@ if __name__ == '__main__':
                         choices=['average', 'discounted'],
                         help='ABLATION: average-reward SMDP differential target (default) '
                              'vs discounted return (per-decision gamma from --discount)')
+    parser.add_argument('--smdp', default='true', type=str,
+                        choices=['true', 'false'],
+                        help='ABLATION (average mode only): SMDP tau-weighted average (true) '
+                             'vs plain MDP per-step average (false)')
 
     args = parser.parse_args()
+    # argparse gives the string 'true'/'false'; convert to bool explicitly
+    # (note: non-empty string 'false' is truthy, so this conversion is required)
+    args.smdp = (args.smdp == 'true')
 
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -83,7 +90,8 @@ if __name__ == '__main__':
     args.rho_lr = 0.02
     agent = DeepTOP_MDP(state_dim, action_dim, hidden, args)
     print(f'[ablation] reward_mode = {args.reward_mode}'
-          + (f' (gamma={args.discount})' if args.reward_mode == 'discounted' else ''))
+          + (f' (gamma={args.discount})' if args.reward_mode == 'discounted' else '')
+          + (f', time_model = {"SMDP" if args.smdp else "MDP"}' if args.reward_mode == 'average' else ''))
 
     resetEnvs()
     agent.reset(state)
@@ -159,6 +167,10 @@ if __name__ == '__main__':
                 print(f'  alpha={alpha} avg_ctx={avg_ctx} backlog={backlog}: '
                       f'thr={thr:.3f} -> cutoff={thr*cap:.1f}')
 
-    out_path = f'deeptop_spec_actor_{args.reward_mode}.pkl'
+    if args.reward_mode == 'average':
+        tag = 'smdp' if args.smdp else 'mdp'
+    else:
+        tag = args.reward_mode
+    out_path = f'deeptop_spec_actor_{tag}.pkl'
     torch.save(agent.actor.state_dict(), out_path)
     print(f'\nSaved actor to {out_path}')
