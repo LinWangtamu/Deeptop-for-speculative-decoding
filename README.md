@@ -34,3 +34,17 @@ python eval_deeptop_spec.py
 ```
 
 Evaluation writes `deeptop_eval.png`.
+
+## v6: multi-k speculative decoding
+
+The v6 source, simulator settings, workload data, Slurm scripts, and experiment
+results are in [`v6/`](v6/). This version learns a threshold policy over
+`k = 1..7` with position-dependent draft acceptance.
+
+```bash
+cd v6
+```
+
+See [the v6 README](v6/README.md) for training, evaluation, and serving commands.
+Model checkpoints (including `deeptop_v6_best.pkl`) are excluded from this
+repository; train one or supply your own before running checkpoint-based commands.
