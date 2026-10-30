@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
+# Create a weight tensor with uniformly sampled values in [-1/sqrt(fanin), 1/sqrt(fanin)].
 def fanin_init(size, fanin=None):
     v = 1.0 / np.sqrt(fanin or size[0])
     return torch.Tensor(size).uniform_(-v, v)
